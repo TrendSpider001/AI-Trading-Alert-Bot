@@ -10,7 +10,7 @@
 
 ```
 ┌─────────────────────────────────────────┐
-│        📱TELEGRAM: @nexastruct          │
+│     📱TELEGRAM: @nexastruct      │
 │                                         │
 │  Questions • Feedback • Custom builds   │
 └─────────────────────────────────────────┘
