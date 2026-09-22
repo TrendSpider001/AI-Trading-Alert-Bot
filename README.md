@@ -9,11 +9,7 @@
 ### 🕸️ **SPIDER TRADING**
 
 ```
-┌────────────────────────────────────────────────────────────────────────────────────────┐
-│                                   📱TELEGRAM: @nexastruct                              │
-│                                                                                        │
-│                           Questions • Feedback • Custom builds                         │
-└────────────────────────────────────────────────────────────────────────────────────────┘
+Welcome to my SPIDER TRADING!
 ```
 
 [![Telegram](https://img.shields.io/badge/Message_on_Telegram-@nexastruct-26a5e4?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/nexastruct)
