@@ -1,0 +1,887 @@
+from copy import deepcopy
+from pathlib import Path
+from typing import Any, TypedDict
+
+import pytest
+
+from freqtrade.constants import Config
+from freqtrade.exchange.exchange import Exchange
+from freqtrade.resolvers.exchange_resolver import ExchangeResolver
+from tests.conftest import EXMS, get_default_conf_usdt
+
+
+class TestExchangeOnlineSetup(TypedDict):
+    pair: str
+    stake_currency: str
+    use_ci_proxy: bool
+    hasQuoteVolume: bool
+    timeframe: str
+    candle_count: int
+    futures: bool
+    futures_only: bool | None
+    futures_pair: str | None
+    candle_count_futures: int | None
+    hasQuoteVolumeFutures: bool | None
+    open_interest_history_days: int | None
+    leverage_tiers_public: bool
+    leverage_in_spot_market: bool
+    trades_lookback_hours: int
+    private_methods: list[str] | None
+    sample_order: list[dict[str, Any]] | None
+    sample_order_futures: list[dict[str, Any]] | None
+    sample_my_trades: list[dict[str, Any]] | None
+    skip_ws_tests: bool | None
+
+
+EXCHANGE_FIXTURE_TYPE = tuple[Exchange, str, TestExchangeOnlineSetup]
+EXCHANGE_WS_FIXTURE_TYPE = tuple[Exchange, str, str]
+
+# Exchanges that should be tested online
+EXCHANGES: dict[str, TestExchangeOnlineSetup] = {
+    "binance": {
+        "pair": "BTC/USDT",
+        "stake_currency": "USDT",
+        "use_ci_proxy": True,
+        "hasQuoteVolume": True,
+        "timeframe": "1h",
+        "candle_count": 1000,
+        "futures": True,
+        "futures_pair": "BTC/USDT:USDT",
+        "candle_count_futures": 499,
+        "hasQuoteVolumeFutures": True,
+        # Binance rejects "startTime" older than 30 days for open interest history.
+        "open_interest_history_days": 30,
+        "leverage_tiers_public": False,
+        "leverage_in_spot_market": False,
+        "trades_lookback_hours": 4,
+        "private_methods": [
+            "fapiPrivateGetPositionSideDual",
+            "fapiPrivateGetMultiAssetsMargin",
+            "sapi_get_spot_delist_schedule",
+        ],
+        "sample_order": [
+            {
+                "exchange_response": {
+                    "symbol": "SOLUSDT",
+                    "orderId": 3551312894,
+                    "orderListId": -1,
+                    "clientOrderId": "x-R4DD3S8297c73a11ccb9dc8f2811ba",
+                    "transactTime": 1674493798550,
+                    "price": "15.50000000",
+                    "origQty": "1.10000000",
+                    "executedQty": "0.00000000",
+                    "cummulativeQuoteQty": "0.00000000",
+                    "status": "NEW",
+                    "timeInForce": "GTC",
+                    "type": "LIMIT",
+                    "side": "BUY",
+                    "workingTime": 1674493798550,
+                    "fills": [],
+                    "selfTradePreventionMode": "NONE",
+                },
+                "pair": "SOL/USDT",
+                "expected": {
+                    "symbol": "SOL/USDT",
+                    "id": "3551312894",
+                    "timestamp": 1674493798550,
+                    "datetime": "2023-01-23T17:09:58.550Z",
+                    "price": 15.5,
+                    "status": "open",
+                    "side": "buy",
+                    "amount": 1.1,
+                },
+            },
+            {
+                "exchange_response": {
+                    "symbol": "SOLUSDT",
+                    "orderId": 3551312894,
+                    "orderListId": -1,
+                    "clientOrderId": "x-R4DD3S8297c73a11ccb9dc8f2811ba",
+                    "transactTime": 1674493798550,
+                    "price": "15.50000000",
+                    "origQty": "1.10000000",
+                    "executedQty": "1.10000000",
+                    "cummulativeQuoteQty": "17.05",
+                    "status": "FILLED",
+                    "timeInForce": "GTC",
+                    "type": "LIMIT",
+                    "side": "BUY",
+                    "workingTime": 1674493798550,
+                    "fills": [],
+                    "selfTradePreventionMode": "NONE",
+                },
+                "pair": "SOL/USDT",
+                "expected": {
+                    "symbol": "SOL/USDT",
+                    "id": "3551312894",
+                    "timestamp": 1674493798550,
+                    "datetime": "2023-01-23T17:09:58.550Z",
+                    "price": 15.5,
+                    "side": "buy",
+                    "status": "closed",
+                    "amount": 1.1,
+                },
+            },
+        ],
+        "sample_order_futures": [
+            {
+                # Futures - create order
+                "exchange_response": {
+                    "orderId": 1235611235,
+                    "symbol": "ONDOUSDT",
+                    "status": "FILLED",
+                    "clientOrderId": "x-abvasdfasdfasd",
+                    "price": "0.3817000",
+                    "origQty": "977.4",
+                    "executedQty": "977.4",
+                    "cumQty": "977.4",
+                    "timeInForce": "GTC",
+                    "type": "LIMIT",
+                    "reduceOnly": True,
+                    "closePosition": False,
+                    "side": "BUY",
+                    "positionSide": "BOTH",
+                    "stopPrice": "0.0000000",
+                    "workingType": "CONTRACT_PRICE",
+                    "priceProtect": False,
+                    "origType": "LIMIT",
+                    "priceMatch": "NONE",
+                    "selfTradePreventionMode": "EXPIRE_MAKER",
+                    "goodTillDate": 0,
+                    "updateTime": 1784606414905,
+                },
+                "pair": "ONDO/USDT:USDT",
+                "expected": {
+                    "symbol": "ONDO/USDT:USDT",
+                    "id": "1235611235",
+                    "timestamp": 1784606414905,
+                    "datetime": "2026-07-21T04:00:14.905Z",
+                    "price": 0.3817,
+                    "status": "closed",
+                    "side": "buy",
+                    "amount": 977.4,
+                    "average": None,  # create order does not contain avgPrice ...
+                },
+            },
+            {
+                # Futures - fetch order
+                "exchange_response": {
+                    "orderId": 1235611235,
+                    "symbol": "ONDOUSDT",
+                    "status": "FILLED",
+                    "clientOrderId": "x-abvasdfasdfasd",
+                    "price": "0.3817000",
+                    "avgPrice": "0.36360000",
+                    "origQty": "977.4",
+                    "executedQty": "977.4",
+                    "cumQuote": "355.38264000",
+                    "timeInForce": "GTC",
+                    "type": "LIMIT",
+                    "reduceOnly": True,
+                    "closePosition": False,
+                    "side": "BUY",
+                    "positionSide": "BOTH",
+                    "stopPrice": "0",
+                    "workingType": "CONTRACT_PRICE",
+                    "priceMatch": "NONE",
+                    "selfTradePreventionMode": "EXPIRE_MAKER",
+                    "goodTillDate": 0,
+                    "priceProtect": False,
+                    "origType": "LIMIT",
+                    "time": 1784606414905,
+                    "updateTime": 1784606414905,
+                },
+                "pair": "ONDO/USDT:USDT",
+                "expected": {
+                    "symbol": "ONDO/USDT:USDT",
+                    "id": "1235611235",
+                    "timestamp": 1784606414905,
+                    "datetime": "2026-07-21T04:00:14.905Z",
+                    "price": 0.3817,
+                    "status": "closed",
+                    "side": "buy",
+                    "amount": 977.4,
+                    "average": 0.3636,
+                },
+            },
+        ],
+    },
+    "binanceus": {
+        "pair": "BTC/USDT",
+        "stake_currency": "USDT",
+        "hasQuoteVolume": True,
+        "timeframe": "1h",
+        "candle_count": 1000,
+        "futures": False,
+        "skip_ws_tests": True,
+        "sample_order": [
+            {
+                "exchange_response": {
+                    "symbol": "SOLUSDT",
+                    "orderId": 3551312894,
+                    "orderListId": -1,
+                    "clientOrderId": "x-R4DD3S8297c73a11ccb9dc8f2811ba",
+                    "transactTime": 1674493798550,
+                    "price": "15.50000000",
+                    "origQty": "1.10000000",
+                    "executedQty": "0.00000000",
+                    "cummulativeQuoteQty": "0.00000000",
+                    "status": "NEW",
+                    "timeInForce": "GTC",
+                    "type": "LIMIT",
+                    "side": "BUY",
+                    "workingTime": 1674493798550,
+                    "fills": [],
+                    "selfTradePreventionMode": "NONE",
+                },
+                "pair": "SOL/USDT",
+                "expected": {
+                    "symbol": "SOL/USDT",
+                    "id": "3551312894",
+                    "timestamp": 1674493798550,
+                    "datetime": "2023-01-23T17:09:58.550Z",
+                    "price": 15.5,
+                    "status": "open",
+                    "amount": 1.1,
+                },
+            }
+        ],
+    },
+    "kraken": {
+        "pair": "BTC/USD",
+        "stake_currency": "USD",
+        "hasQuoteVolume": True,
+        "timeframe": "1h",
+        "candle_count": 720,
+        "leverage_tiers_public": False,
+        "leverage_in_spot_market": True,
+        "trades_lookback_hours": 12,
+        "sample_balances": {
+            "exchange_response": {
+                "result": {
+                    "ADA": {"balance": "0.00000000", "hold_trade": "0.00000000"},
+                    "ADA.F": {"balance": "2.00000000", "hold_trade": "0.00000000"},
+                    "XBT": {"balance": "0.00060000", "hold_trade": "0.00000000"},
+                    "XBT.F": {"balance": "0.00100000", "hold_trade": "0.00000000"},
+                    "ZEUR": {"balance": "1000.00000000", "hold_trade": "0.00000000"},
+                    "ZUSD": {"balance": "1000.00000000", "hold_trade": "0.00000000"},
+                }
+            },
+            "expected": {
+                "ADA": {"free": 0.0, "total": 0.0, "used": 0.0},
+                "ADA.F": {"free": 2.0, "total": 2.0, "used": 0.0},
+                "BTC": {"free": 0.0006, "total": 0.0006, "used": 0.0},
+                # XBT.F should be mapped to BTC.F
+                "BTC.F": {"free": 0.001, "total": 0.001, "used": 0.0},
+                "EUR": {"free": 1000.0, "total": 1000.0, "used": 0.0},
+                "USD": {"free": 1000.0, "total": 1000.0, "used": 0.0},
+            },
+        },
+    },
+    "kucoin": {
+        "pair": "XRP/USDT",
+        "stake_currency": "USDT",
+        "hasQuoteVolume": True,
+        "timeframe": "1h",
+        "candle_count": 1500,
+        "leverage_tiers_public": False,
+        "leverage_in_spot_market": True,
+        "sample_order": [
+            {
+                "exchange_response": {"id": "63d6742d0adc5570001d2bbf7"},
+                "pair": "SOL/USDT",
+                "expected": {
+                    "symbol": "SOL/USDT",
+                    "id": "63d6742d0adc5570001d2bbf7",
+                    "timestamp": None,
+                    "datetime": None,
+                    "price": None,
+                    "status": None,
+                    "amount": None,
+                },
+            },  # create order
+            {
+                "exchange_response": {
+                    "id": "63d6742d0adc5570001d2bbf7",
+                    "symbol": "SOL-USDT",
+                    "opType": "DEAL",
+                    "type": "limit",
+                    "side": "buy",
+                    "price": "15.5",
+                    "size": "1.1",
+                    "funds": "0",
+                    "dealFunds": "17.05",
+                    "dealSize": "1.1",
+                    "fee": "0.000065252",
+                    "feeCurrency": "USDT",
+                    "stp": "",
+                    "stop": "",
+                    "stopTriggered": False,
+                    "stopPrice": "0",
+                    "timeInForce": "GTC",
+                    "postOnly": False,
+                    "hidden": False,
+                    "iceberg": False,
+                    "visibleSize": "0",
+                    "cancelAfter": 0,
+                    "channel": "API",
+                    "clientOid": "0a053870-11bf-41e5-be61-b272a4cb62e1",
+                    "remark": None,
+                    "tags": "partner:ccxt",
+                    "isActive": False,
+                    "cancelExist": False,
+                    "createdAt": 1674493798550,
+                    "tradeType": "TRADE",
+                },
+                "pair": "SOL/USDT",
+                "expected": {
+                    "symbol": "SOL/USDT",
+                    "id": "63d6742d0adc5570001d2bbf7",
+                    "timestamp": 1674493798550,
+                    "datetime": "2023-01-23T17:09:58.550Z",
+                    "price": 15.5,
+                    "status": "closed",
+                    "amount": 1.1,
+                },
+            },
+        ],
+    },
+    "gate": {
+        "pair": "BTC/USDT",
+        "stake_currency": "USDT",
+        "hasQuoteVolume": True,
+        "timeframe": "1h",
+        "candle_count": 1000,
+        "futures": True,
+        "futures_pair": "BTC/USDT:USDT",
+        "candle_count_futures": 1999,
+        "hasQuoteVolumeFutures": True,
+        # gate rejects a "from" older than 180 days ("from time exceeds 180-day limit").
+        "open_interest_history_days": 179,
+        "leverage_tiers_public": True,
+        "leverage_in_spot_market": True,
+        "sample_order": [
+            {
+                "exchange_response": {
+                    "id": "276266139423",
+                    "text": "apiv4",
+                    "create_time": "1674493798",
+                    "update_time": "1674493798",
+                    "create_time_ms": "1674493798550",
+                    "update_time_ms": "1674493798550",
+                    "status": "closed",
+                    "currency_pair": "SOL_USDT",
+                    "type": "limit",
+                    "account": "spot",
+                    "side": "buy",
+                    "amount": "1.1",
+                    "price": "15.5",
+                    "time_in_force": "gtc",
+                    "iceberg": "0",
+                    "left": "0",
+                    "fill_price": "17.05",
+                    "filled_total": "17.05",
+                    "avg_deal_price": "15.5",
+                    "fee": "0.0000018",
+                    "fee_currency": "SOL",
+                    "point_fee": "0",
+                    "gt_fee": "0",
+                    "gt_maker_fee": "0",
+                    "gt_taker_fee": "0.0015",
+                    "gt_discount": True,
+                    "rebated_fee": "0",
+                    "rebated_fee_currency": "USDT",
+                },
+                "pair": "SOL/USDT",
+                "expected": {
+                    "symbol": "SOL/USDT",
+                    "id": "276266139423",
+                    "timestamp": 1674493798550,
+                    "datetime": "2023-01-23T17:09:58.550Z",
+                    "price": 15.5,
+                    "average": 15.5,
+                    "status": "closed",
+                    "amount": 1.1,
+                },
+            },
+            {
+                "exchange_response": {
+                    # market order
+                    "id": "276401180529",
+                    "text": "apiv4",
+                    "create_time": "1674493798",
+                    "update_time": "1674493798",
+                    "create_time_ms": "1674493798550",
+                    "update_time_ms": "1674493798550",
+                    "status": "cancelled",
+                    "currency_pair": "SOL_USDT",
+                    "type": "market",
+                    "account": "spot",
+                    "side": "buy",
+                    "amount": "17.05",
+                    "price": "0",
+                    "time_in_force": "ioc",
+                    "iceberg": "0",
+                    "left": "0.0000000016228",
+                    "fill_price": "17.05",
+                    "filled_total": "17.05",
+                    "avg_deal_price": "15.5",
+                    "fee": "0",
+                    "fee_currency": "SOL",
+                    "point_fee": "0.0199999999967544",
+                    "gt_fee": "0",
+                    "gt_maker_fee": "0",
+                    "gt_taker_fee": "0",
+                    "gt_discount": False,
+                    "rebated_fee": "0",
+                    "rebated_fee_currency": "USDT",
+                },
+                "pair": "SOL/USDT",
+                "expected": {
+                    "symbol": "SOL/USDT",
+                    "id": "276401180529",
+                    "timestamp": 1674493798550,
+                    "datetime": "2023-01-23T17:09:58.550Z",
+                    "price": 15.5,
+                    "status": "canceled",
+                    "amount": 1.1,
+                },
+            },
+        ],
+        "sample_my_trades": [
+            {
+                "id": "123412341234",
+                "create_time": "167997798",
+                "create_time_ms": "167997798825.566200",
+                "currency_pair": "SOL_USDT",
+                "side": "sell",
+                "role": "taker",
+                "amount": "0.0115",
+                "price": "1712.63",
+                "order_id": "1234123412",
+                "fee": "0.0",
+                "fee_currency": "USDT",
+                "point_fee": "0.03939049",
+                "gt_fee": "0.0",
+                "amend_text": "-",
+            }
+        ],
+    },
+    "okx": {
+        "pair": "BTC/USDT",
+        "stake_currency": "USDT",
+        "hasQuoteVolume": True,
+        "timeframe": "1h",
+        "candle_count": 300,
+        "futures": True,
+        "futures_pair": "BTC/USDT:USDT",
+        "hasQuoteVolumeFutures": False,
+        # okx raises "Illegal time range" beyond 30 days of open interest history.
+        "open_interest_history_days": 30,
+        "leverage_tiers_public": True,
+        "leverage_in_spot_market": True,
+        "private_methods": ["fetch_accounts"],
+    },
+    "bybit": {
+        "pair": "BTC/USDT",
+        "stake_currency": "USDT",
+        "hasQuoteVolume": True,
+        "use_ci_proxy": True,
+        "timeframe": "1h",
+        "candle_count": 1000,
+        "futures_pair": "BTC/USDT:USDT",
+        "futures": True,
+        # Bybit serves well over 2 years of open interest history - capped here to keep the
+        # runtime of this test in check, 200 candles per call add up quickly.
+        "open_interest_history_days": 180,
+        "orderbook_max_entries": 50,
+        "leverage_tiers_public": True,
+        "leverage_in_spot_market": True,
+        "sample_order": [
+            {
+                "exchange_response": {
+                    "orderId": "1274754916287346280",
+                    "orderLinkId": "1666798627015730",
+                    "symbol": "SOLUSDT",
+                    "createdTime": "1674493798550",
+                    "price": "15.5",
+                    "qty": "1.1",
+                    "orderType": "Limit",
+                    "side": "Buy",
+                    "orderStatus": "New",
+                    "timeInForce": "GTC",
+                    "accountId": "5555555",
+                    "execQty": "0",
+                    "orderCategory": "0",
+                },
+                "pair": "SOL/USDT",
+                "expected": {
+                    "symbol": "SOL/USDT",
+                    "id": "1274754916287346280",
+                    "timestamp": 1674493798550,
+                    "datetime": "2023-01-23T17:09:58.550Z",
+                    "price": 15.5,
+                    "side": "buy",
+                    "status": "open",
+                    "amount": 1.1,
+                },
+            }
+        ],
+    },
+    "bitget": {
+        "pair": "BTC/USDT",
+        "stake_currency": "USDT",
+        "hasQuoteVolume": True,
+        "timeframe": "1h",
+        "candle_count": 1000,
+        "futures": True,
+        "futures_pair": "BTC/USDT:USDT",
+        "leverage_tiers_public": True,
+        "leverage_in_spot_market": True,
+    },
+    "coinex": {
+        "pair": "BTC/USDT",
+        "stake_currency": "USDT",
+        "hasQuoteVolume": False,
+        "timeframe": "1h",
+        "candle_count": 1000,
+        "orderbook_max_entries": 50,
+    },
+    "htx": {
+        "pair": "ETH/BTC",
+        "stake_currency": "BTC",
+        "hasQuoteVolume": True,
+        "timeframe": "1h",
+        "candle_count": 1000,
+    },
+    "bitvavo": {
+        "pair": "BTC/EUR",
+        "stake_currency": "EUR",
+        "hasQuoteVolume": True,
+        "timeframe": "1h",
+        "candle_count": 1440,
+        "leverage_tiers_public": False,
+        "leverage_in_spot_market": False,
+    },
+    "bingx": {
+        "pair": "BTC/USDT",
+        "stake_currency": "USDT",
+        "hasQuoteVolume": True,
+        "timeframe": "1h",
+        "candle_count": 1000,
+        "futures": False,
+        "sample_order": [
+            {
+                "exchange_response": {
+                    "symbol": "SOL-USDT",
+                    "orderId": "1762393630149869568",
+                    "transactTime": "1674493798550",
+                    "price": "15.5",
+                    "stopPrice": "0",
+                    "origQty": "1.1",
+                    "executedQty": "1.1",
+                    "cummulativeQuoteQty": "17.05",
+                    "status": "FILLED",
+                    "type": "LIMIT",
+                    "side": "BUY",
+                    "clientOrderID": "",
+                },
+                "pair": "SOL/USDT",
+                "expected": {
+                    "symbol": "SOL/USDT",
+                    "id": "1762393630149869568",
+                    "timestamp": 1674493798550,
+                    "datetime": "2023-01-23T17:09:58.550Z",
+                    "price": 15.5,
+                    "average": 15.5,
+                    "status": "closed",
+                    "amount": 1.1,
+                },
+            },
+            {
+                "exchange_response": {
+                    "symbol": "SOL-USDT",
+                    "orderId": "1762393630149869567",
+                    "transactTime": "1674493798550",
+                    "price": "15.5",
+                    "stopPrice": "0",
+                    "origQty": "1.1",
+                    "executedQty": "1.1",
+                    "cummulativeQuoteQty": "17.05",
+                    "status": "FILLED",
+                    "type": "MARKET",
+                    "side": "BUY",
+                    "clientOrderID": "",
+                },
+                "pair": "SOL/USDT",
+                "expected": {
+                    "symbol": "SOL/USDT",
+                    "id": "1762393630149869567",
+                    "timestamp": 1674493798550,
+                    "datetime": "2023-01-23T17:09:58.550Z",
+                    "price": 15.5,
+                    "average": 15.5,
+                    "status": "closed",
+                    "amount": 1.1,
+                },
+            },
+        ],
+    },
+    "hyperliquid": {
+        "pair": "BTC/USDC",
+        "stake_currency": "USDC",
+        "hasQuoteVolume": False,
+        "timeframe": "30m",
+        "futures": True,
+        "candle_count": 5000,
+        "orderbook_max_entries": 20,
+        "futures_pair": "BTC/USDC:USDC",
+        # Assert that HIP3 pairs are fetched as part of load_markets
+        "futures_alt_pairs": ["XYZ-NVDA/USDC:USDC", "VNTL-ANTHROPIC/USDH:USDH"],
+        "hasQuoteVolumeFutures": True,
+        "leverage_tiers_public": False,
+        "leverage_in_spot_market": False,
+        # TODO: re-enable hyperliquid websocket tests
+        "skip_ws_tests": True,
+    },
+    "krakenfutures": {
+        "pair": "BTC/USD:USD",
+        "stake_currency": "USD",
+        "hasQuoteVolume": False,
+        "skip_ws_tests": True,
+        "timeframe": "1h",
+        "futures": True,
+        "futures_only": True,
+        "candle_count": 2000,
+        "futures_pair": "BTC/USD:USD",
+        "hasQuoteVolumeFutures": False,
+        "leverage_tiers_public": True,
+        "sample_order_futures": [
+            {
+                # Regular market order
+                "exchange_response": {
+                    "uid": "a11a8dc2-0440-4fe1-5212-1bx15c8f1c8e",
+                    "accountUid": "cabdb242-5111-4dac-bac-76f33395d76d",
+                    "tradeable": "PF_XBTUSD",
+                    "direction": "Sell",
+                    "quantity": "0",
+                    "filled": "0.0004",
+                    "timestamp": 1771354195241,
+                    "limitPrice": "67164.00",
+                    "orderType": "IoC",
+                    "clientId": "",
+                    "reduceOnly": False,
+                    "lastUpdateTimestamp": 1771354195241,
+                    "regulatoryExternalUid": "ae198dd6-6be0-4014-8af-ebd472190648",
+                    "status": "closed",
+                },
+                "pair": "BTC/USD:USD",
+                "expected": {
+                    "symbol": "BTC/USD:USD",
+                    "id": "a11a8dc2-0440-4fe1-5212-1bx15c8f1c8e",
+                    "timestamp": 1771354195241,
+                    "datetime": "2026-02-17T18:49:55.241Z",
+                    "price": None,
+                    # Average should be None (it's not correct for market orders)
+                    "average": None,
+                    "status": "closed",
+                    "type": "market",
+                    "amount": 0.0004,
+                    "filled": 0.0004,
+                    "side": "sell",
+                    "triggerPrice": None,
+                    "stopPrice": None,
+                    "stopLossPrice": None,
+                },
+            },
+            {
+                # Trigger order
+                "exchange_response": {
+                    "order": {
+                        "type": "TRIGGER_ORDER",
+                        "orderId": "a11a8ff3-17f3-5112-8caa-9cbbacfa1c8e",
+                        "cliOrdId": None,
+                        "symbol": "PF_XBTUSD",
+                        "side": "buy",
+                        "quantity": 0.0004,
+                        "limitPrice": 71712,
+                        "reduceOnly": True,
+                        "timestamp": "2026-02-17T16:26:02.918Z",
+                        "lastUpdateTimestamp": "2026-02-17T16:26:02.918Z",
+                        "priceTriggerOptions": {
+                            "triggerPrice": 71641,
+                            "triggerSignal": "LAST_PRICE",
+                            "triggerSide": "TRIGGER_ABOVE",
+                            "limitPriceOffsetValue": None,
+                            "limitPriceOffsetUnit": None,
+                        },
+                    },
+                    "status": "TRIGGER_PLACED",
+                    "updateReason": None,
+                    "error": None,
+                },
+                "pair": "BTC/USD:USD",
+                "expected": {
+                    "symbol": "BTC/USD:USD",
+                    "id": "a11a8ff3-17f3-5112-8caa-9cbbacfa1c8e",
+                    "timestamp": 1771345562918,
+                    "datetime": "2026-02-17T16:26:02.918Z",
+                    # TODO: re-verify this ...
+                    # "price": 71712.0,
+                    "price": None,
+                    "status": "open",
+                    "amount": 0.0004,
+                    # TODO: filled should be 0, not None.
+                    "filled": None,
+                    "side": "buy",
+                    "triggerPrice": 71641.0,
+                    "stopPrice": 71641.0,
+                    # krakenfutures uses stopPrice - so this is fine.
+                    "stopLossPrice": None,
+                },
+            },
+            {
+                # Canceled order
+                "exchange_response": {
+                    "order": {
+                        "type": "ORDER",
+                        "orderId": "a159faef-6a0f-4651-bb78-xxfa4c71ac7e",
+                        "cliOrdId": None,
+                        "symbol": "PF_XBTUSD",
+                        "side": "buy",
+                        "quantity": 0.0022,
+                        "filled": 0,
+                        "limitPrice": 68000,
+                        "reduceOnly": False,
+                        "timestamp": "2026-03-21T07:32:21.555Z",
+                        "lastUpdateTimestamp": "2026-03-21T07:32:21.555Z",
+                    },
+                    "status": "CANCELLED",
+                    "updateReason": "CANCELLED_BY_USER",
+                    "error": None,
+                },
+                "pair": "BTC/USD:USD",
+                "expected": {
+                    "symbol": "BTC/USD:USD",
+                    "id": "a159faef-6a0f-4651-bb78-xxfa4c71ac7e",
+                    "timestamp": 1774078341555,
+                    "datetime": "2026-03-21T07:32:21.555Z",
+                    "price": None,
+                    "status": "canceled",
+                    "filled": 0.0,
+                },
+            },
+        ],
+    },
+}
+
+EXCHANGES_FUTURES = [exch for exch, params in EXCHANGES.items() if params.get("futures")]
+EXCHANGES_SPOT = [exch for exch, params in EXCHANGES.items() if not params.get("futures_only")]
+
+
+@pytest.fixture(scope="class")
+def exchange_conf():
+    config = get_default_conf_usdt((Path(__file__).parent / "testdata").resolve())
+    config["exchange"]["pair_whitelist"] = []
+    config["exchange"]["api_key"] = None
+    config["exchange"]["secret"] = None
+    config["dry_run"] = False
+    config["entry_pricing"]["use_order_book"] = True
+    config["exit_pricing"]["use_order_book"] = True
+    return config
+
+
+def set_test_proxy(config: Config, use_proxy: bool) -> Config:
+    # Set proxy to test in CI.
+    import os
+
+    if use_proxy and (proxy := os.environ.get("CI_WEB_PROXY")):
+        config1 = deepcopy(config)
+        config1["exchange"]["ccxt_config"] = {
+            "httpsProxy": proxy,
+            "wsProxy": proxy,
+        }
+        return config1
+
+    return config
+
+
+def get_exchange(exchange_name, exchange_conf, class_mocker):
+    exchange_params = EXCHANGES[exchange_name]
+    exchange_conf = set_test_proxy(exchange_conf, exchange_params.get("use_ci_proxy", False))
+    exchange_conf["exchange"]["name"] = exchange_name
+    exchange_conf["stake_currency"] = exchange_params["stake_currency"]
+    class_mocker.patch(f"{EXMS}.ft_additional_exchange_init")
+    exchange = ExchangeResolver.load_exchange(
+        exchange_conf, validate=True, load_leverage_tiers=True
+    )
+
+    return exchange, exchange_name, exchange_params
+
+
+def get_futures_exchange(exchange_name, exchange_conf, class_mocker):
+    exchange_params = EXCHANGES[exchange_name]
+
+    if exchange_params.get("futures") is not True:
+        pytest.skip(f"Exchange {exchange_name} does not support futures.")
+    exchange_conf = deepcopy(exchange_conf)
+    exchange_conf = set_test_proxy(exchange_conf, exchange_params.get("use_ci_proxy", False))
+    exchange_conf["exchange"]["name"] = exchange_name
+    exchange_conf["stake_currency"] = exchange_params["stake_currency"]
+    exchange_conf["trading_mode"] = "futures"
+    exchange_conf["margin_mode"] = "isolated"
+
+    class_mocker.patch("freqtrade.exchange.binance.Binance.fill_leverage_tiers")
+    class_mocker.patch(f"{EXMS}.fetch_trading_fees")
+    class_mocker.patch(f"{EXMS}.ft_additional_exchange_init")
+    class_mocker.patch(f"{EXMS}.load_cached_leverage_tiers", return_value=None)
+    class_mocker.patch(f"{EXMS}.cache_leverage_tiers")
+
+    exchange = ExchangeResolver.load_exchange(
+        exchange_conf, validate=True, load_leverage_tiers=True
+    )
+    return exchange, exchange_name, exchange_params
+
+
+@pytest.fixture(params=EXCHANGES_SPOT, scope="class")
+def exchange(request, exchange_conf, class_mocker):
+    exchange, name, exchange_params = get_exchange(request.param, exchange_conf, class_mocker)
+    yield exchange, name, exchange_params
+    exchange.close()
+
+
+@pytest.fixture(params=EXCHANGES_FUTURES, scope="class")
+def exchange_futures(request, exchange_conf, class_mocker):
+    exchange, name, exchange_params = get_futures_exchange(
+        request.param, exchange_conf, class_mocker
+    )
+    yield exchange, name, exchange_params
+    exchange.close()
+
+
+@pytest.fixture(params=["spot", "futures"], scope="class")
+def exchange_mode(request):
+    return request.param
+
+
+@pytest.fixture(params=EXCHANGES, scope="class")
+def exchange_ws(request, exchange_conf, exchange_mode, class_mocker):
+    exchange_conf["exchange"]["enable_ws"] = True
+    exchange_param = EXCHANGES[request.param]
+    if exchange_param.get("skip_ws_tests"):
+        pytest.skip(f"{request.param} does not support websocket tests.")
+    if exchange_mode == "spot":
+        exchange, name, _ = get_exchange(request.param, exchange_conf, class_mocker)
+        pair = exchange_param["pair"]
+    elif exchange_param.get("futures"):
+        exchange, name, _ = get_futures_exchange(
+            request.param, exchange_conf, class_mocker=class_mocker
+        )
+        pair = exchange_param["futures_pair"]
+    else:
+        pytest.skip("Exchange does not support futures.")
+
+    if not exchange._exchange_ws:
+        pytest.skip("Exchange does not support watch_ohlcv.")
+    yield exchange, name, pair
+    exchange.close()

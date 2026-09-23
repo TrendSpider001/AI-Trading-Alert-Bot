@@ -1,0 +1,949 @@
+# pragma pylint: disable=missing-docstring, protected-access, C0103
+
+import logging
+import re
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+from pandas import DataFrame, Timestamp, read_feather
+from pandas.testing import assert_frame_equal
+from pyarrow import ArrowNotImplementedError
+
+from freqtrade.candle_columns import get_candle_columns
+from freqtrade.configuration import TimeRange
+from freqtrade.constants import AVAILABLE_DATAHANDLERS, DEFAULT_DATAFRAME_COLUMNS
+from freqtrade.data.converter import ohlcv_to_dataframe
+from freqtrade.data.history.datahandlers.featherdatahandler import FeatherDataHandler
+from freqtrade.data.history.datahandlers.idatahandler import (
+    IDataHandler,
+    get_datahandler,
+    get_datahandlerclass,
+)
+from freqtrade.data.history.datahandlers.jsondatahandler import JsonDataHandler, JsonGzDataHandler
+from freqtrade.data.history.datahandlers.parquetdatahandler import ParquetDataHandler
+from freqtrade.enums import CandleType, TradingMode
+from freqtrade.exceptions import OperationalException
+from tests.conftest import log_has, log_has_re
+
+
+@pytest.mark.parametrize(
+    "filename,pair,timeframe,candletype",
+    [
+        ("XMR_BTC-5m.json", "XMR_BTC", "5m", ""),
+        ("XMR_USDT-1h.h5", "XMR_USDT", "1h", ""),
+        ("BTC-PERP-1h.h5", "BTC-PERP", "1h", ""),
+        ("BTC_USDT-2h.jsongz", "BTC_USDT", "2h", ""),
+        ("BTC_USDT-2h-mark.jsongz", "BTC_USDT", "2h", "mark"),
+        ("XMR_USDT-1h-mark.h5", "XMR_USDT", "1h", "mark"),
+        ("XMR_USDT-1h-random.h5", "XMR_USDT", "1h", "random"),
+        ("BTC-PERP-1h-index.h5", "BTC-PERP", "1h", "index"),
+        ("XMR_USDT_USDT-1h-mark.h5", "XMR_USDT_USDT", "1h", "mark"),
+    ],
+)
+def test_datahandler_ohlcv_regex(filename, pair, timeframe, candletype):
+    regex = JsonDataHandler._OHLCV_REGEX
+
+    match = re.search(regex, filename)
+    assert len(match.groups()) > 1
+    assert match[1] == pair
+    assert match[2] == timeframe
+    assert match[3] == candletype
+
+
+@pytest.mark.parametrize(
+    "pair,expected",
+    [
+        ("XMR_USDT", "XMR/USDT"),
+        ("BTC_USDT", "BTC/USDT"),
+        ("USDT_BUSD", "USDT/BUSD"),
+        ("BTC_USDT_USDT", "BTC/USDT:USDT"),  # Futures
+        ("XRP_USDT_USDT", "XRP/USDT:USDT"),  # futures
+        ("XYZ-XRP_USDT_USDT", "XYZ-XRP/USDT:USDT"),  # hip3 futures
+        ("UNITTEST_USDT", "UNITTEST/USDT"),
+        ("币安人生_USDT_USDT", "币安人生/USDT:USDT"),  # futures
+    ],
+)
+def test_rebuild_pair_from_filename(pair, expected):
+    assert IDataHandler.rebuild_pair_from_filename(pair) == expected
+
+
+def test_datahandler_normalize_columns_ohlcv(testdatadir):
+    dh = FeatherDataHandler(testdatadir)
+    df = DataFrame(
+        [[1, 2.0, 3.0, 1.0, 2.5, 100.0]], columns=["date", "open", "high", "low", "close", "volume"]
+    )
+    assert (
+        list(dh._normalize_columns(df, "XRP/USDT:USDT", CandleType.SPOT).columns)
+        == DEFAULT_DATAFRAME_COLUMNS
+    )
+    # Extra columns are dropped, order is normalized
+    df2 = df.assign(extra=1)[["volume", "extra", "close", "low", "high", "open", "date"]]
+    assert (
+        list(dh._normalize_columns(df2, "XRP/USDT:USDT", CandleType.SPOT).columns)
+        == DEFAULT_DATAFRAME_COLUMNS
+    )
+
+
+def test_datahandler_normalize_columns_funding_rate(testdatadir):
+    dh = FeatherDataHandler(testdatadir)
+    # Current layout - passed through unchanged
+    current = DataFrame([[1, 0.0005]], columns=["date", "funding_rate"])
+    res = dh._normalize_columns(current, "XRP/USDT:USDT", CandleType.FUNDING_RATE)
+    assert list(res.columns) == ["date", "funding_rate"]
+    assert res.iloc[0]["funding_rate"] == 0.0005
+
+    # Legacy layout - "open" carries the rate, the zero columns are dropped
+    legacy = DataFrame([[1, 0.0005, 0.0, 0.0, 0.0, 0.0]], columns=DEFAULT_DATAFRAME_COLUMNS)
+    res = dh._normalize_columns(legacy, "XRP/USDT:USDT", CandleType.FUNDING_RATE)
+    assert list(res.columns) == ["date", "funding_rate"]
+    assert res.iloc[0]["funding_rate"] == 0.0005
+
+    # Both layouts present - the current columns win, stale ones are dropped
+    both = DataFrame(
+        [[1, 0.0005, 9.9, 0.0, 0.0, 0.0, 0.0]],
+        columns=["date", "funding_rate", "open", "high", "low", "close", "volume"],
+    )
+    res = dh._normalize_columns(both, "XRP/USDT:USDT", CandleType.FUNDING_RATE)
+    assert list(res.columns) == ["date", "funding_rate"]
+    assert res.iloc[0]["funding_rate"] == 0.0005
+
+
+def test_datahandler_normalize_columns_positional(testdatadir):
+    dh = JsonDataHandler(testdatadir)
+    # json stores positionally - any names on the incoming frame are meaningless
+    current = DataFrame([[1, 0.0005]])
+    assert list(
+        dh._normalize_columns(current, "XRP/USDT:USDT", CandleType.FUNDING_RATE).columns
+    ) == [
+        "date",
+        "funding_rate",
+    ]
+    legacy = DataFrame([[1, 0.0005, 0.0, 0.0, 0.0, 0.0]])
+    res = dh._normalize_columns(legacy, "XRP/USDT:USDT", CandleType.FUNDING_RATE)
+    assert list(res.columns) == ["date", "funding_rate"]
+    assert res.iloc[0]["funding_rate"] == 0.0005
+    spot = dh._normalize_columns(
+        DataFrame([[1, 2.0, 3.0, 1.0, 2.5, 100.0]]), "XRP/USDT:USDT", CandleType.SPOT
+    )
+    assert list(spot.columns) == DEFAULT_DATAFRAME_COLUMNS
+
+
+@pytest.mark.parametrize("width", [0, 1, 3, 5, 7])
+def test_datahandler_normalize_columns_bad_width(testdatadir, width):
+    dh = JsonDataHandler(testdatadir)
+    df = DataFrame([[0] * width]) if width else DataFrame()
+    for candle_type in (CandleType.FUNDING_RATE, CandleType.SPOT):
+        with pytest.raises(ValueError, match=r"Unexpected column count .* for XRP/USDT:USDT"):
+            dh._normalize_columns(df, "XRP/USDT:USDT", candle_type)
+
+
+@pytest.mark.parametrize("datahandler", ["feather", "parquet"])
+def test_datahandler_ohlcv_load_unknown_layout(tmp_path, datahandler, caplog):
+    """A file in an unknown layout is skipped - it must not abort loading of all other data."""
+    dh = get_datahandler(tmp_path, datahandler)
+    (tmp_path / "futures").mkdir()
+    filename = dh._pair_data_filename(tmp_path, "XRP/USDT:USDT", "1h", CandleType.MARK)
+    dh._store_dataframe(DataFrame([[1, 2.0, 3.0]], columns=["a", "b", "c"]), filename)
+
+    res = dh.ohlcv_load("XRP/USDT:USDT", "1h", CandleType.MARK)
+    assert res.empty
+    assert list(res.columns) == DEFAULT_DATAFRAME_COLUMNS
+    assert log_has_re(r"Error loading data from .*Unexpected column count 3", caplog)
+
+
+def test_datahandler_funding_rate_legacy_load_and_migrate(testdatadir, tmp_path, caplog):
+    """Legacy 6-column funding files load transparently and are rewritten 2-wide."""
+    from pyarrow import dataset
+
+    caplog.set_level(logging.DEBUG)
+
+    dhbase = FeatherDataHandler(testdatadir)
+    legacy_raw = read_feather(testdatadir / "futures/XRP_USDT_USDT-1h-funding_rate.feather")
+    assert list(legacy_raw.columns) == DEFAULT_DATAFRAME_COLUMNS
+
+    loaded = dhbase.ohlcv_load("XRP/USDT:USDT", "1h", CandleType.FUNDING_RATE, fill_missing=False)
+    # funding_rate is canonical, "open" stays available as a compatibility alias
+    assert list(loaded.columns) == ["date", "funding_rate", "open"]
+    assert (loaded["open"] == loaded["funding_rate"]).all()
+    assert loaded["funding_rate"].tolist() == legacy_raw["open"].astype(float).tolist()
+    assert log_has("Migrating legacy funding rate columns for XRP/USDT:USDT on read.", caplog)
+
+    # Storing writes the new layout - aliases never reach disk
+    (tmp_path / "futures").mkdir()
+    dh_new = FeatherDataHandler(tmp_path)
+    dh_new.ohlcv_store("XRP/USDT:USDT", "1h", loaded, CandleType.FUNDING_RATE)
+    stored = tmp_path / "futures/XRP_USDT_USDT-1h-funding_rate.feather"
+    assert dataset.dataset(stored, format="feather").schema.names == ["date", "funding_rate"]
+
+    reloaded = dh_new.ohlcv_load("XRP/USDT:USDT", "1h", CandleType.FUNDING_RATE, fill_missing=False)
+    assert reloaded.equals(loaded)
+
+
+@pytest.mark.parametrize("datahandler", ["jsongz", "feather"])
+def test_datahandler_funding_rate_legacy_load_formats(testdatadir, datahandler):
+    """Both the named (feather) and positional (json) legacy layouts read identically."""
+    dh = get_datahandler(testdatadir, datahandler)
+    df = dh.ohlcv_load("XRP/USDT:USDT", "1h", CandleType.FUNDING_RATE, fill_missing=False)
+    assert list(df.columns) == ["date", "funding_rate", "open"]
+    assert len(df) == 91
+    assert (df["open"] == df["funding_rate"]).all()
+
+
+@pytest.mark.parametrize("datahandler", ["feather", "parquet"])
+@pytest.mark.parametrize(
+    "candle_type", [CandleType.SPOT, CandleType.FUNDING_RATE, CandleType.OPEN_INTEREST]
+)
+@pytest.mark.parametrize("typed", [True, False])
+def test_datahandler_ohlcv_load_empty_file(tmp_path, datahandler, candle_type, typed):
+    """An empty stored file must load as an empty dataframe, not raise.
+
+    An untyped empty frame is written with "null"-typed columns, which read back as
+    object dtype - there is no schema to interpret, and "no data" is the right answer.
+    """
+    (tmp_path / "futures").mkdir()
+    dh = get_datahandler(tmp_path, datahandler)
+    if typed:
+        empty = ohlcv_to_dataframe(
+            [],
+            "1h",
+            "XRP/USDT:USDT",
+            fill_missing=False,
+            drop_incomplete=False,
+            candle_type=candle_type,
+        )
+    else:
+        empty = DataFrame(columns=get_candle_columns(candle_type))
+    dh.ohlcv_store("XRP/USDT:USDT", "1h", empty, candle_type)
+
+    assert dh._ohlcv_load("XRP/USDT:USDT", "1h", None, candle_type).empty
+    loaded = dh.ohlcv_load("XRP/USDT:USDT", "1h", candle_type, warn_no_data=False)
+    assert loaded.empty
+    assert list(loaded.columns) == get_candle_columns(candle_type)
+
+
+@pytest.mark.parametrize("datahandler", AVAILABLE_DATAHANDLERS)
+def test_datahandler_open_interest_roundtrip(tmp_path, datahandler):
+    """Open interest survives a store/load cycle with one side missing.
+
+    Bybit reports only the base amount on linear markets, so an all-NaN
+    open_interest_value column must round-trip as NaN - not as 0, and not as an error.
+    """
+    (tmp_path / "futures").mkdir()
+    dh = get_datahandler(tmp_path, datahandler)
+    raw = [
+        [1630454400000, 108721.214, None],
+        [1630458000000, 109261.55, None],
+        [1630461600000, 107807.866, None],
+    ]
+    df = ohlcv_to_dataframe(
+        raw,
+        "1h",
+        "XRP/USDT:USDT",
+        fill_missing=False,
+        drop_incomplete=False,
+        candle_type=CandleType.OPEN_INTEREST,
+    )
+    dh.ohlcv_store("XRP/USDT:USDT", "1h", df, CandleType.OPEN_INTEREST)
+
+    loaded = dh.ohlcv_load("XRP/USDT:USDT", "1h", CandleType.OPEN_INTEREST, fill_missing=False)
+    assert list(loaded.columns) == ["date", "open_interest_amount", "open_interest_value"]
+    assert len(loaded) == 3
+    assert loaded["open_interest_amount"].tolist() == [108721.214, 109261.55, 107807.866]
+    assert loaded["open_interest_value"].isna().all()
+    assert loaded["open_interest_value"].dtype == "float64"
+    assert_frame_equal(loaded, df)
+
+
+def test_datahandler_ohlcv_get_available_data(testdatadir):
+    paircombs = FeatherDataHandler.ohlcv_get_available_data(testdatadir, TradingMode.SPOT)
+    # Convert to set to avoid failures due to sorting
+    assert set(paircombs) == {
+        ("UNITTEST/BTC", "5m", CandleType.SPOT),
+        ("ETH/BTC", "5m", CandleType.SPOT),
+        ("XLM/BTC", "5m", CandleType.SPOT),
+        ("TRX/BTC", "5m", CandleType.SPOT),
+        ("LTC/BTC", "5m", CandleType.SPOT),
+        ("XMR/BTC", "5m", CandleType.SPOT),
+        ("ZEC/BTC", "5m", CandleType.SPOT),
+        ("UNITTEST/BTC", "1m", CandleType.SPOT),
+        ("ADA/BTC", "5m", CandleType.SPOT),
+        ("ETC/BTC", "5m", CandleType.SPOT),
+        ("NXT/BTC", "5m", CandleType.SPOT),
+        ("DASH/BTC", "5m", CandleType.SPOT),
+        ("XRP/ETH", "1m", CandleType.SPOT),
+        ("XRP/ETH", "5m", CandleType.SPOT),
+        ("BTC/USDT", "5m", CandleType.SPOT),
+        ("XRP/USDT", "5m", CandleType.SPOT),
+        ("UNITTEST/BTC", "30m", CandleType.SPOT),
+        ("UNITTEST/BTC", "8m", CandleType.SPOT),
+    }
+
+    paircombs = FeatherDataHandler.ohlcv_get_available_data(testdatadir, TradingMode.FUTURES)
+    # Convert to set to avoid failures due to sorting
+    assert set(paircombs) == {
+        ("UNITTEST/USDT:USDT", "1h", "mark"),
+        ("UNITTEST/USDT:USDT", "1h", "funding_rate"),
+        ("XRP/USDT:USDT", "5m", "futures"),
+        ("XRP/USDT:USDT", "1h", "futures"),
+        ("XRP/USDT:USDT", "1h", "mark"),
+        ("XRP/USDT:USDT", "1h", "funding_rate"),
+    }
+
+    paircombs = JsonGzDataHandler.ohlcv_get_available_data(testdatadir, TradingMode.SPOT)
+    assert set(paircombs) == {("UNITTEST/BTC", "8m", CandleType.SPOT)}
+
+
+def test_jsondatahandler_ohlcv_purge(mocker, testdatadir):
+    mocker.patch.object(Path, "exists", MagicMock(return_value=False))
+    unlinkmock = mocker.patch.object(Path, "unlink", MagicMock())
+    dh = JsonGzDataHandler(testdatadir)
+    assert not dh.ohlcv_purge("UNITTEST/NONEXIST", "5m", "")
+    assert not dh.ohlcv_purge("UNITTEST/NONEXIST", "5m", candle_type="mark")
+    assert unlinkmock.call_count == 0
+
+    mocker.patch.object(Path, "exists", MagicMock(return_value=True))
+    assert dh.ohlcv_purge("UNITTEST/NONEXIST", "5m", "")
+    assert dh.ohlcv_purge("UNITTEST/NONEXIST", "5m", candle_type="mark")
+    assert unlinkmock.call_count == 2
+
+
+def test_jsondatahandler_ohlcv_load(testdatadir, caplog):
+    dh = JsonDataHandler(testdatadir)
+
+    df = dh.ohlcv_load("UNITTEST/BTC", "1m", "spot")
+    assert len(df) > 0
+
+    #     # Failure case (empty array)
+    df1 = dh.ohlcv_load("NOPAIR/XXX", "4m", "spot")
+    assert len(df1) == 0
+    assert log_has("Could not load data for NOPAIR/XXX.", caplog)
+    assert df.columns.equals(df1.columns)
+
+
+def test_datahandler_ohlcv_data_min_max(testdatadir):
+    dh = JsonDataHandler(testdatadir)
+    min_max = dh.ohlcv_data_min_max("UNITTEST/BTC", "5m", "spot")
+    assert len(min_max) == 3
+
+    # Empty pair
+    min_max = dh.ohlcv_data_min_max("UNITTEST/BTC", "8m", "spot")
+    assert len(min_max) == 3
+    assert min_max[0] == datetime.fromtimestamp(0, tz=UTC)
+    assert min_max[0] == min_max[1]
+    # Empty pair2
+    min_max = dh.ohlcv_data_min_max("NOPAIR/XXX", "41m", "spot")
+    assert len(min_max) == 3
+    assert min_max[0] == datetime.fromtimestamp(0, tz=UTC)
+    assert min_max[0] == min_max[1]
+
+    # Existing pair ...
+    min_max = dh.ohlcv_data_min_max("UNITTEST/BTC", "1m", "spot")
+    assert len(min_max) == 3
+    assert min_max[0] == datetime(2017, 11, 4, 23, 2, tzinfo=UTC)
+    assert min_max[1] == datetime(2017, 11, 14, 22, 59, tzinfo=UTC)
+
+
+def test_datahandler__check_empty_df(testdatadir, caplog):
+    dh = JsonDataHandler(testdatadir)
+    expected_text = r"Price jump in UNITTEST/USDT, 1h, spot between"
+    df = DataFrame(
+        [
+            [
+                1511686200000,  # 8:50:00
+                8.794,  # open
+                8.948,  # high
+                8.794,  # low
+                8.88,  # close
+                2255,  # volume (in quote currency)
+            ],
+            [
+                1511686500000,  # 8:55:00
+                8.88,
+                8.942,
+                8.88,
+                8.893,
+                9911,
+            ],
+            [
+                1511687100000,  # 9:05:00
+                8.891,
+                8.893,
+                8.875,
+                8.877,
+                2251,
+            ],
+            [
+                1511687400000,  # 9:10:00
+                8.877,
+                8.883,
+                8.895,
+                8.817,
+                123551,
+            ],
+        ],
+        columns=["date", "open", "high", "low", "close", "volume"],
+    )
+
+    dh._check_empty_df(df, "UNITTEST/USDT", "1h", CandleType.SPOT, True, True)
+    assert not log_has_re(expected_text, caplog)
+    df = DataFrame(
+        [
+            [
+                1511686200000,  # 8:50:00
+                8.794,  # open
+                8.948,  # high
+                8.794,  # low
+                8.88,  # close
+                2255,  # volume (in quote currency)
+            ],
+            [
+                1511686500000,  # 8:55:00
+                8.88,
+                8.942,
+                8.88,
+                8.893,
+                9911,
+            ],
+            [
+                1511687100000,  # 9:05:00
+                889.1,  # Price jump by several decimals
+                889.3,
+                887.5,
+                887.7,
+                2251,
+            ],
+            [
+                1511687400000,  # 9:10:00
+                8.877,
+                8.883,
+                8.895,
+                8.817,
+                123551,
+            ],
+        ],
+        columns=["date", "open", "high", "low", "close", "volume"],
+    )
+
+    dh._check_empty_df(df, "UNITTEST/USDT", "1h", CandleType.SPOT, True, True)
+    assert log_has_re(expected_text, caplog)
+
+
+# @pytest.mark.parametrize('datahandler', [])
+@pytest.mark.skip("All datahandlers currently support trades data.")
+def test_datahandler_trades_not_supported(
+    datahandler,
+    testdatadir,
+):
+    # Currently disabled. Re-enable should a new provider not support trades data.
+    dh = get_datahandler(testdatadir, datahandler)
+    with pytest.raises(NotImplementedError):
+        dh.trades_load("UNITTEST/ETH")
+    with pytest.raises(NotImplementedError):
+        dh.trades_store("UNITTEST/ETH", MagicMock())
+
+
+def test_jsondatahandler_trades_load(testdatadir, caplog):
+    dh = JsonGzDataHandler(testdatadir)
+    logmsg = "Old trades format detected - converting"
+    dh.trades_load("XRP/ETH", TradingMode.SPOT)
+    assert not log_has(logmsg, caplog)
+
+    # Test conversion is happening
+    dh.trades_load("XRP/OLD", TradingMode.SPOT)
+    assert log_has(logmsg, caplog)
+
+
+@pytest.mark.parametrize("datahandler", AVAILABLE_DATAHANDLERS)
+def test_datahandler_ohlcv_append(
+    datahandler,
+    testdatadir,
+):
+    dh = get_datahandler(testdatadir, datahandler)
+    with pytest.raises(NotImplementedError):
+        dh.ohlcv_append("UNITTEST/ETH", "5m", DataFrame(), CandleType.SPOT)
+    with pytest.raises(NotImplementedError):
+        dh.ohlcv_append("UNITTEST/ETH", "5m", DataFrame(), CandleType.MARK)
+
+
+@pytest.mark.parametrize("datahandler", AVAILABLE_DATAHANDLERS)
+def test_datahandler_trades_append(datahandler, testdatadir):
+    dh = get_datahandler(testdatadir, datahandler)
+    with pytest.raises(NotImplementedError):
+        dh.trades_append("UNITTEST/ETH", DataFrame())
+
+
+@pytest.mark.parametrize(
+    "datahandler,expected",
+    [
+        ("jsongz", {"XRP/ETH", "XRP/OLD"}),
+        ("feather", {"XRP/ETH"}),
+        ("parquet", {"XRP/ETH"}),
+    ],
+)
+def test_datahandler_trades_get_pairs(testdatadir, datahandler, expected):
+    pairs = get_datahandlerclass(datahandler).trades_get_pairs(testdatadir)
+    # Convert to set to avoid failures due to sorting
+    assert set(pairs) == expected
+
+
+def test_hdf5datahandler_deprecated(testdatadir):
+    with pytest.raises(
+        OperationalException, match=r"DEPRECATED: The hdf5 dataformat is deprecated and has.*"
+    ):
+        get_datahandler(testdatadir, "hdf5")
+
+
+@pytest.mark.parametrize(
+    "pair,timeframe,candle_type,candle_append,startdt,enddt",
+    [
+        # Data goes from 2018-01-10 - 2018-01-30
+        ("UNITTEST/BTC", "5m", "spot", "", "2018-01-15", "2018-01-19"),
+        # Mark data goes from to 2021-11-15 2021-11-19
+        ("UNITTEST/USDT:USDT", "1h", "mark", "-mark", "2021-11-16", "2021-11-18"),
+        # Legacy 6-column funding rate file - goes from 2021-11-18 to 2021-12-18
+        (
+            "XRP/USDT:USDT",
+            "1h",
+            "funding_rate",
+            "-funding_rate",
+            "2021-11-20",
+            "2021-12-01",
+        ),
+        # Funding rate file already stored in the current 2-column layout
+        (
+            "UNITTEST/USDT:USDT",
+            "1h",
+            "funding_rate",
+            "-funding_rate",
+            "2021-11-20",
+            "2021-12-01",
+        ),
+    ],
+)
+@pytest.mark.parametrize("datahandler", ["feather", "parquet"])
+def test_generic_datahandler_ohlcv_load_and_resave(
+    datahandler,
+    mocker,
+    testdatadir,
+    tmp_path,
+    pair,
+    timeframe,
+    candle_type,
+    candle_append,
+    startdt,
+    enddt,
+    caplog,
+):
+    tmpdir2 = tmp_path
+    if candle_type not in ("", "spot"):
+        tmpdir2 = tmp_path / "futures"
+        tmpdir2.mkdir()
+    # Load data from one common file
+    dhbase = get_datahandler(testdatadir, "feather")
+    ohlcv = dhbase._ohlcv_load(pair, timeframe, None, candle_type=candle_type)
+    assert isinstance(ohlcv, DataFrame)
+    assert len(ohlcv) > 0
+
+    # Get data to test
+    dh = get_datahandler(testdatadir, datahandler)
+
+    file = tmpdir2 / f"UNITTEST_NEW-{timeframe}{candle_append}.{dh._get_file_extension()}"
+    assert not file.is_file()
+
+    dh1 = get_datahandler(tmp_path, datahandler)
+    dh1.ohlcv_store("UNITTEST/NEW", timeframe, ohlcv, candle_type=candle_type)
+    assert file.is_file()
+
+    assert not ohlcv[ohlcv["date"] < startdt].empty
+
+    timerange = TimeRange.parse_timerange(f"{startdt.replace('-', '')}-{enddt.replace('-', '')}")
+
+    ohlcv = dhbase.ohlcv_load(pair, timeframe, timerange=timerange, candle_type=candle_type)
+    ohlcv1 = dh1.ohlcv_load("UNITTEST/NEW", timeframe, timerange=timerange, candle_type=candle_type)
+
+    assert len(ohlcv) == len(ohlcv1)
+    assert ohlcv.equals(ohlcv1)
+    assert ohlcv[ohlcv["date"] < startdt].empty
+    assert ohlcv[ohlcv["date"] > enddt].empty
+
+    # Try loading inexisting file
+    ohlcv = dh1.ohlcv_load("UNITTEST/NONEXIST", timeframe, candle_type=candle_type)
+    assert ohlcv.empty
+
+    # Try loading a file that exists but errors - Arrow fails, so the pandas reader is
+    # used as fallback, which errors as well.
+    mocker.patch(
+        "freqtrade.data.history.datahandlers.arrowdatahandler.dataset.dataset",
+        side_effect=ValueError("Test"),
+    )
+    mocker.patch(
+        "freqtrade.data.history.datahandlers.featherdatahandler.read_feather",
+        side_effect=Exception("Test"),
+    )
+    mocker.patch(
+        "freqtrade.data.history.datahandlers.parquetdatahandler.read_parquet",
+        side_effect=Exception("Test"),
+    )
+    ohlcv_e = dh1.ohlcv_load("UNITTEST/NEW", timeframe, candle_type=candle_type)
+    assert ohlcv_e.empty
+    assert log_has_re("Error loading data from", caplog)
+
+
+@pytest.mark.parametrize("datahandler", ["jsongz", "feather", "parquet"])
+def test_datahandler_trades_load(testdatadir, datahandler):
+    dh = get_datahandler(testdatadir, datahandler)
+    trades = dh.trades_load("XRP/ETH", TradingMode.SPOT)
+    assert isinstance(trades, DataFrame)
+    assert trades.iloc[0]["timestamp"] == 1570752011620
+    assert trades.iloc[0]["date"] == Timestamp("2019-10-11 00:00:11.620000+0000")
+    assert trades.iloc[-1]["cost"] == 0.1986231
+
+    trades1 = dh.trades_load("UNITTEST/NONEXIST", TradingMode.SPOT)
+    assert isinstance(trades, DataFrame)
+    assert trades1.empty
+
+
+@pytest.mark.parametrize("datahandler", ["jsongz", "feather", "parquet"])
+def test_datahandler_trades_store(testdatadir, tmp_path, datahandler):
+    dh = get_datahandler(testdatadir, datahandler)
+    trades = dh.trades_load("XRP/ETH", TradingMode.SPOT)
+
+    dh1 = get_datahandler(tmp_path, datahandler)
+    dh1.trades_store("XRP/NEW", trades, TradingMode.SPOT)
+
+    file = tmp_path / f"XRP_NEW-trades.{dh1._get_file_extension()}"
+    assert file.is_file()
+    # Load trades back
+    trades_new = dh1.trades_load("XRP/NEW", TradingMode.SPOT)
+    assert_frame_equal(trades, trades_new, check_exact=True)
+    assert len(trades_new) == len(trades)
+
+
+@pytest.mark.parametrize("datahandler", ["jsongz", "feather", "parquet"])
+def test_datahandler_trades_purge(mocker, testdatadir, datahandler):
+    mocker.patch.object(Path, "exists", MagicMock(return_value=False))
+    unlinkmock = mocker.patch.object(Path, "unlink", MagicMock())
+    dh = get_datahandler(testdatadir, datahandler)
+    assert not dh.trades_purge("UNITTEST/NONEXIST", TradingMode.SPOT)
+    assert unlinkmock.call_count == 0
+
+    mocker.patch.object(Path, "exists", MagicMock(return_value=True))
+    assert dh.trades_purge("UNITTEST/NONEXIST", TradingMode.SPOT)
+    assert unlinkmock.call_count == 1
+
+
+def test_datahandler_trades_get_available_data(testdatadir):
+    paircombs = FeatherDataHandler.trades_get_available_data(testdatadir, TradingMode.SPOT)
+    # Convert to set to avoid failures due to sorting
+    assert set(paircombs) == {"XRP/ETH"}
+
+    paircombs = FeatherDataHandler.trades_get_available_data(testdatadir, TradingMode.FUTURES)
+    # Convert to set to avoid failures due to sorting
+    assert set(paircombs) == set()
+
+    paircombs = JsonGzDataHandler.trades_get_available_data(testdatadir, TradingMode.SPOT)
+    assert set(paircombs) == {"XRP/ETH", "XRP/OLD"}
+
+
+def test_datahandler_trades_data_min_max(testdatadir):
+    dh = FeatherDataHandler(testdatadir)
+    min_max = dh.trades_data_min_max("XRP/ETH", TradingMode.SPOT)
+    assert len(min_max) == 3
+
+    # Empty pair
+    min_max = dh.trades_data_min_max("NADA/ETH", TradingMode.SPOT)
+    assert len(min_max) == 3
+    assert min_max[0] == datetime.fromtimestamp(0, tz=UTC)
+    assert min_max[0] == min_max[1]
+
+    # Existing pair ...
+    min_max = dh.trades_data_min_max("XRP/ETH", TradingMode.SPOT)
+    assert len(min_max) == 3
+    assert min_max[0] == datetime(2019, 10, 11, 0, 0, 11, 620000, tzinfo=UTC)
+    assert min_max[1] == datetime(2019, 10, 13, 11, 19, 28, 844000, tzinfo=UTC)
+
+
+def test_gethandlerclass():
+    cl = get_datahandlerclass("json")
+    assert cl == JsonDataHandler
+    assert issubclass(cl, IDataHandler)
+
+    cl = get_datahandlerclass("jsongz")
+    assert cl == JsonGzDataHandler
+    assert issubclass(cl, IDataHandler)
+    assert issubclass(cl, JsonDataHandler)
+
+    cl = get_datahandlerclass("feather")
+    assert cl == FeatherDataHandler
+    assert issubclass(cl, IDataHandler)
+
+    cl = get_datahandlerclass("parquet")
+    assert cl == ParquetDataHandler
+    assert issubclass(cl, IDataHandler)
+
+    with pytest.raises(ValueError, match=r"No datahandler for .*"):
+        get_datahandlerclass("DeadBeef")
+
+
+def test_get_datahandler(testdatadir):
+    dh = get_datahandler(testdatadir, "json")
+    assert isinstance(dh, JsonDataHandler)
+    dh = get_datahandler(testdatadir, "jsongz")
+    assert isinstance(dh, JsonGzDataHandler)
+    dh1 = get_datahandler(testdatadir, "jsongz", dh)
+    assert id(dh1) == id(dh)
+
+
+@pytest.fixture
+def feather_dh(testdatadir):
+    return FeatherDataHandler(testdatadir)
+
+
+@pytest.fixture
+def trades_full(feather_dh):
+    df = feather_dh.trades_load("XRP/ETH", TradingMode.SPOT)
+    assert not df.empty
+    return df
+
+
+@pytest.fixture
+def timerange_mid(trades_full):
+    # Pick a mid-range window using actual timestamps
+    mid_start = int(trades_full["timestamp"].iloc[len(trades_full) // 3])
+    mid_end = int(trades_full["timestamp"].iloc[(2 * len(trades_full)) // 3])
+    return TimeRange("date", "date", startts=mid_start, stopts=mid_end)
+
+
+def test_feather_trades_timerange_filter_fullspan(feather_dh, trades_full):
+    timerange_full = TimeRange(
+        "date",
+        "date",
+        startts=int(trades_full["timestamp"].min()),
+        stopts=int(trades_full["timestamp"].max()),
+    )
+    # Full-span filter should equal unfiltered
+    filtered = feather_dh.trades_load("XRP/ETH", TradingMode.SPOT, timerange=timerange_full)
+    assert_frame_equal(
+        trades_full.reset_index(drop=True), filtered.reset_index(drop=True), check_exact=True
+    )
+
+
+def test_feather_trades_timerange_filter_subset(feather_dh, trades_full, timerange_mid):
+    # Subset filter should be a subset of the full-span filter
+    subset = feather_dh.trades_load("XRP/ETH", TradingMode.SPOT, timerange=timerange_mid)
+    assert not subset.empty
+    assert subset["timestamp"].min() >= timerange_mid.startts
+    assert subset["timestamp"].max() <= timerange_mid.stopts
+    assert len(subset) < len(trades_full)
+
+
+@pytest.mark.parametrize("exception", [ValueError("fail"), ArrowNotImplementedError("fail")])
+def test_feather_trades_timerange_pushdown_fallback(
+    feather_dh, trades_full, timerange_mid, mocker, caplog, exception
+):
+    # Pushdown filter should fail, so fallback should load the entire file
+    mocker.patch(
+        "freqtrade.data.history.datahandlers.arrowdatahandler.dataset.dataset",
+        side_effect=exception,
+    )
+
+    with caplog.at_level("WARNING"):
+        out = feather_dh.trades_load("XRP/ETH", TradingMode.SPOT, timerange=timerange_mid)
+
+    assert len(out) == len(trades_full)
+    assert any(
+        "Unable to use Arrow filtering, loading entire trades file" in r.message
+        for r in caplog.records
+    )
+
+
+def test_feather_trades_timerange_open_start(feather_dh, trades_full):
+    # Open start: stop timestamp but no start (startts=0)
+    stop_ts = int(trades_full["timestamp"].iloc[(2 * len(trades_full)) // 3])
+    tr = TimeRange(None, "date", startts=0, stopts=stop_ts)
+
+    filtered = feather_dh.trades_load("XRP/ETH", TradingMode.SPOT, timerange=tr)
+    assert 0 < len(filtered) < len(trades_full)
+    assert filtered["timestamp"].max() <= stop_ts
+    # First row should match full's first row
+    assert filtered.iloc[0]["timestamp"] == trades_full.iloc[0]["timestamp"]
+
+
+def test_feather_trades_timerange_open_end(feather_dh, trades_full):
+    # Open end: start timestamp but no stop (stopts=0)
+    start_ts = int(trades_full["timestamp"].iloc[len(trades_full) // 3])
+    tr = TimeRange("date", None, startts=start_ts, stopts=0)
+
+    filtered = feather_dh.trades_load("XRP/ETH", TradingMode.SPOT, timerange=tr)
+    assert 0 < len(filtered) < len(trades_full)
+    assert filtered["timestamp"].min() >= start_ts
+    # Last row should match full's last row
+    assert filtered.iloc[-1]["timestamp"] == trades_full.iloc[-1]["timestamp"]
+
+
+def test_feather_trades_timerange_fully_open(feather_dh, trades_full):
+    # Fully open: no start or stop bounds (both 0)
+    tr = TimeRange(None, None, startts=0, stopts=0)
+
+    filtered = feather_dh.trades_load("XRP/ETH", TradingMode.SPOT, timerange=tr)
+    # Should equal unfiltered load
+    assert_frame_equal(
+        trades_full.reset_index(drop=True), filtered.reset_index(drop=True), check_exact=True
+    )
+
+
+def test_feather_build_arrow_trades_filter(feather_dh):
+    # None timerange should return None
+    assert feather_dh._build_arrow_trades_filter(None) is None
+
+    # Fully open (both bounds 0) should return None
+    tr_fully_open = TimeRange(None, None, startts=0, stopts=0)
+    assert feather_dh._build_arrow_trades_filter(tr_fully_open) is None
+
+    # Open start (startts=0) should return stop filter only
+    tr_open_start = TimeRange(None, "date", startts=0, stopts=1000)
+    filter_open_start = feather_dh._build_arrow_trades_filter(tr_open_start)
+    assert filter_open_start is not None
+    # Should be a single expression (timestamp <= stopts)
+    assert str(filter_open_start).count("<=") == 1
+    assert str(filter_open_start).count(">=") == 0
+
+    # Open end (stopts=0) should return start filter only
+    tr_open_end = TimeRange("date", None, startts=500, stopts=0)
+    filter_open_end = feather_dh._build_arrow_trades_filter(tr_open_end)
+    assert filter_open_end is not None
+    # Should be a single expression (timestamp >= startts)
+    assert str(filter_open_end).count(">=") == 1
+    assert str(filter_open_end).count("<=") == 0
+
+    # Closed range should return combined filter
+    tr_closed = TimeRange("date", "date", startts=500, stopts=1000)
+    filter_closed = feather_dh._build_arrow_trades_filter(tr_closed)
+    assert filter_closed is not None
+    # Should contain both >= and <= (combined with &)
+    filter_str = str(filter_closed)
+    assert ">=" in filter_str
+    assert "<=" in filter_str
+
+
+def test_build_arrow_ohlcv_filter(feather_dh):
+    # No timerange should return None
+    assert feather_dh._build_arrow_ohlcv_filter(None, "5m") is None
+    # Unbounded timerange should return None
+    assert feather_dh._build_arrow_ohlcv_filter(TimeRange(), "5m") is None
+
+    # Open start should return stop filter only - widened by one candle
+    tr_open_start = TimeRange.parse_timerange("-20260119")
+    filter_open_start = str(feather_dh._build_arrow_ohlcv_filter(tr_open_start, "5m"))
+    assert filter_open_start.count("<=") == 1
+    assert filter_open_start.count(">=") == 0
+    assert "2026-01-19 00:05:00" in filter_open_start
+
+    # Open end should return start filter only - widened by one candle
+    tr_open_end = TimeRange.parse_timerange("20260115-")
+    filter_open_end = str(feather_dh._build_arrow_ohlcv_filter(tr_open_end, "5m"))
+    assert filter_open_end.count(">=") == 1
+    assert filter_open_end.count("<=") == 0
+    assert "2026-01-14 23:55:00" in filter_open_end
+
+    # Closed range should combine both, widened by one candle on each side
+    tr_closed = TimeRange.parse_timerange("20260115-20260119")
+    filter_closed = str(feather_dh._build_arrow_ohlcv_filter(tr_closed, "1h"))
+    assert "2026-01-14 23:00:00" in filter_closed
+    assert "2026-01-19 01:00:00" in filter_closed
+
+
+# UNITTEST/BTC 5m spans 2018-01-10 04:55 to 2018-01-30 04:50.
+@pytest.mark.parametrize("datahandler", ["feather", "parquet"])
+@pytest.mark.parametrize(
+    "timerange,same_warnings",
+    [
+        ("20180115-20180119", True),  # aligned to the candle grid
+        ("-20180119", True),  # open start
+        ("20180115-", True),  # open end
+        ("20180101-20180119", True),  # starts before the available data
+        ("20180115-20180201", True),  # ends after the available data
+        ("20250101-20250201", True),  # no data in range at all
+        ("1516003320-1516348980", True),  # not aligned to the candle grid (08:02 / 08:03)
+        # Starts inside the gap punched below, which is wider than the one candle the bounds
+        # are widened by. The pushdown then sees no candle before the requested start and
+        # warns that the data starts late - a full read, seeing the whole file, does not.
+        ("1516082400-1516233600", False),  # 2018-01-16 06:00 (in the gap) - 2018-01-18
+    ],
+)
+def test_ohlcv_load_pushdown_matches_full_read(
+    testdatadir, tmp_path, datahandler, timerange, same_warnings, mocker, caplog
+):
+    # Pushing the timerange filter into Arrow must not change data or warnings.
+    dh = get_datahandler(tmp_path, datahandler)
+    ohlcv = get_datahandler(testdatadir, "feather")._ohlcv_load("UNITTEST/BTC", "5m", None, "spot")
+    # Drop 2018-01-16 00:00 - 12:00, so gaps (exchange downtime) are covered as well.
+    gap = (ohlcv["date"] >= Timestamp("2018-01-16", tz="UTC")) & (
+        ohlcv["date"] < Timestamp("2018-01-16 12:00", tz="UTC")
+    )
+    dh.ohlcv_store("UNITTEST/BTC", "5m", ohlcv[~gap], "spot")
+
+    tr = TimeRange.parse_timerange(timerange)
+
+    caplog.clear()
+    pushdown = dh.ohlcv_load("UNITTEST/BTC", "5m", "spot", timerange=tr)
+    pushdown_logs = sorted(caplog.messages)
+
+    # Disable the pushdown - the full file is read and trimmed by ohlcv_load instead.
+    caplog.clear()
+    mocker.patch.object(dh, "_build_arrow_ohlcv_filter", return_value=None)
+    full_read = dh.ohlcv_load(
+        "UNITTEST/BTC", "5m", "spot", timerange=TimeRange.parse_timerange(timerange)
+    )
+
+    assert_frame_equal(full_read, pushdown, check_exact=True)
+    if same_warnings:
+        assert sorted(caplog.messages) == pushdown_logs
+
+
+@pytest.mark.parametrize("datahandler", ["feather", "parquet"])
+def test_ohlcv_load_pushdown_limits_read(testdatadir, tmp_path, datahandler):
+    # The timerange must actually reach Arrow - _ohlcv_load does not trim by itself.
+    dh = get_datahandler(tmp_path, datahandler)
+    ohlcv = get_datahandler(testdatadir, "feather")._ohlcv_load("UNITTEST/BTC", "5m", None, "spot")
+    dh.ohlcv_store("UNITTEST/BTC", "5m", ohlcv, "spot")
+
+    timerange = TimeRange.parse_timerange("20180115-20180119")
+    full = dh._ohlcv_load("UNITTEST/BTC", "5m", None, "spot")
+    limited = dh._ohlcv_load("UNITTEST/BTC", "5m", timerange, "spot")
+
+    assert len(limited) < len(full)
+    # Bounds are widened by exactly one candle - ohlcv_load trims the rest.
+    assert limited.iloc[0]["date"] == timerange.startdt - timedelta(minutes=5)
+    assert limited.iloc[-1]["date"] == timerange.stopdt + timedelta(minutes=5)
+
+
+@pytest.mark.parametrize(
+    "exception",
+    [
+        ValueError("fail"),
+        # Arrow raises this when a filter can't be bound to the column - e.g. a tz-aware
+        # bound against a tz-naive date column. It's a NotImplementedError, not a
+        # ValueError, so it only reaches the fallback via ArrowException.
+        ArrowNotImplementedError("fail"),
+    ],
+)
+def test_ohlcv_load_pushdown_fallback(feather_dh, mocker, caplog, exception):
+    # If Arrow filtering is unavailable, the whole file is read (and trimmed later).
+    tr = TimeRange.parse_timerange("20180115-20180119")
+    expected = feather_dh.ohlcv_load("UNITTEST/BTC", "5m", "spot", timerange=tr)
+
+    mocker.patch(
+        "freqtrade.data.history.datahandlers.arrowdatahandler.dataset.dataset",
+        side_effect=exception,
+    )
+
+    with caplog.at_level("WARNING"):
+        out = feather_dh.ohlcv_load(
+            "UNITTEST/BTC", "5m", "spot", timerange=TimeRange.parse_timerange("20180115-20180119")
+        )
+
+    assert log_has_re("Unable to use Arrow filtering, loading entire ohlcv file.*", caplog)
+    assert_frame_equal(expected, out, check_exact=True)

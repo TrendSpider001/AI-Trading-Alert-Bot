@@ -1,0 +1,218 @@
+# pragma pylint: disable=missing-docstring, C0103
+from datetime import UTC, datetime
+
+import pytest
+
+from freqtrade.configuration import TimeRange
+from freqtrade.exceptions import OperationalException
+
+
+def test_parse_timerange_incorrect():
+    timerange = TimeRange.parse_timerange("")
+    assert timerange == TimeRange(None, None, 0, 0)
+    timerange = TimeRange.parse_timerange("20100522-")
+    assert TimeRange("date", None, 1274486400, 0) == timerange
+    assert timerange.timerange_str == "20100522-"
+    timerange = TimeRange.parse_timerange("-20100522")
+    assert TimeRange(None, "date", 0, 1274486400) == timerange
+    assert timerange.timerange_str == "-20100522"
+    timerange = TimeRange.parse_timerange("20100522-20150730")
+    assert timerange == TimeRange("date", "date", 1274486400, 1438214400)
+    assert timerange.timerange_str == "20100522-20150730"
+    assert timerange.start_fmt == "2010-05-22 00:00:00"
+    assert timerange.stop_fmt == "2015-07-30 00:00:00"
+
+    # Added test for unix timestamp - BTC genesis date
+    assert TimeRange("date", None, 1231006505, 0) == TimeRange.parse_timerange("1231006505-")
+    assert TimeRange(None, "date", 0, 1233360000) == TimeRange.parse_timerange("-1233360000")
+    timerange = TimeRange.parse_timerange("1231006505-1233360000")
+    assert TimeRange("date", "date", 1231006505, 1233360000) == timerange
+    assert isinstance(timerange.startdt, datetime)
+    assert isinstance(timerange.stopdt, datetime)
+    assert timerange.startdt == datetime.fromtimestamp(1231006505, tz=UTC)
+    assert timerange.stopdt == datetime.fromtimestamp(1233360000, tz=UTC)
+    # Non-midnight timestamps round-trip with minute (or second) precision
+    assert timerange.timerange_str == "20090103T181505-20090131"
+
+    timerange = TimeRange.parse_timerange("1231006505000-1233360000000")
+    assert TimeRange("date", "date", 1231006505, 1233360000) == timerange
+
+    timerange = TimeRange.parse_timerange("1231006505000-")
+    assert TimeRange("date", None, 1231006505, 0) == timerange
+
+    timerange = TimeRange.parse_timerange("-1231006505000")
+    assert TimeRange(None, "date", 0, 1231006505) == timerange
+
+    with pytest.raises(OperationalException, match=r"Incorrect syntax.*"):
+        TimeRange.parse_timerange("-")
+
+    with pytest.raises(
+        OperationalException, match=r"Start date is after stop date for timerange.*"
+    ):
+        TimeRange.parse_timerange("20100523-20100522")
+
+
+def test_parse_timerange_minutes():
+    timerange = TimeRange.parse_timerange("20100522T1030-")
+    assert TimeRange("date", None, 1274524200, 0) == timerange
+    assert timerange.timerange_str == "20100522T1030-"
+    assert timerange.start_fmt == "2010-05-22 10:30:00"
+
+    timerange = TimeRange.parse_timerange("-20100522T1030")
+    assert TimeRange(None, "date", 0, 1274524200) == timerange
+    assert timerange.timerange_str == "-20100522T1030"
+
+    timerange = TimeRange.parse_timerange("20100522T1030-20150730T2359")
+    assert TimeRange("date", "date", 1274524200, 1438300740) == timerange
+    assert timerange.timerange_str == "20100522T1030-20150730T2359"
+
+    # Seconds are supported, too
+    timerange = TimeRange.parse_timerange("20100522T103045-20150730T235901")
+    assert TimeRange("date", "date", 1274524245, 1438300741) == timerange
+    assert timerange.timerange_str == "20100522T103045-20150730T235901"
+
+    # Midnight keeps the plain date format
+    timerange = TimeRange.parse_timerange("20100522T0000-20150730T0000")
+    assert TimeRange("date", "date", 1274486400, 1438214400) == timerange
+    assert timerange.timerange_str == "20100522-20150730"
+
+    with pytest.raises(
+        OperationalException, match=r"Start date is after stop date for timerange.*"
+    ):
+        TimeRange.parse_timerange("20100522T1030-20100522T1029")
+
+
+@pytest.mark.parametrize(
+    "timerange,expected,expected_str",
+    [
+        (
+            "20100522-20100523T1030",
+            TimeRange("date", "date", 1274486400, 1274610600),
+            "20100522-20100523T1030",
+        ),
+        (
+            "20100522T1030-20100523",
+            TimeRange("date", "date", 1274524200, 1274572800),
+            "20100522T1030-20100523",
+        ),
+        (
+            "1274524200-20100523T1030",
+            TimeRange("date", "date", 1274524200, 1274610600),
+            "20100522T1030-20100523T1030",
+        ),
+        (
+            "20100522T1030-1274610600000",
+            TimeRange("date", "date", 1274524200, 1274610600),
+            "20100522T1030-20100523T1030",
+        ),
+        (
+            "20100522T1030-",
+            TimeRange("date", None, 1274524200, 0),
+            "20100522T1030-",
+        ),
+        (
+            "-20100522T103002",
+            TimeRange(None, "date", 0, 1274524202),
+            "-20100522T103002",
+        ),
+        (
+            "20100522-",
+            TimeRange("date", None, 1274486400, 0),
+            "20100522-",
+        ),
+        (
+            "-20100522",
+            TimeRange(None, "date", 0, 1274486400),
+            "-20100522",
+        ),
+        (
+            "",
+            TimeRange(None, None, 0, 0),
+            "-",
+        ),
+    ],
+)
+def test_parse_timerange_mixed_formats(timerange, expected, expected_str):
+    tr = TimeRange.parse_timerange(timerange)
+    assert tr == expected
+    assert tr.timerange_str == expected_str
+
+
+@pytest.mark.parametrize(
+    "timerange",
+    [
+        "-",
+        "20100522",
+        "20100522-20100523-20100524",
+        "20100522t1030-",
+        "20100522T103-",
+        "20100522T10300-",
+        "20100522T1060-",
+        "20100522T2530-",
+        "20100532T1030-",
+        "20100522 1030-",
+        "20100522T10:30-",
+    ],
+)
+def test_parse_timerange_invalid(timerange):
+    with pytest.raises(OperationalException, match=r"Incorrect syntax for timerange.*"):
+        TimeRange.parse_timerange(timerange)
+
+
+def test_subtract_start():
+    x = TimeRange("date", "date", 1274486400, 1438214400)
+    x.subtract_start(300)
+    assert x.startts == 1274486400 - 300
+
+    # Do nothing if no startdate exists
+    x = TimeRange(None, "date", 0, 1438214400)
+    x.subtract_start(300)
+    assert not x.startts
+    assert not x.startdt
+
+    x = TimeRange("date", None, 1274486400, 0)
+    x.subtract_start(300)
+    assert x.startts == 1274486400 - 300
+
+
+def test_TimeRange_copy():
+    x = TimeRange("date", "date", 1274486400, 1438214400)
+    y = x.copy()
+
+    # Equal in value, but a distinct object
+    assert y == x
+    assert y is not x
+    assert isinstance(y, TimeRange)
+
+    # Mutating the copy does not affect the original
+    y.subtract_start(300)
+    assert y.startts == 1274486400 - 300
+    assert x.startts == 1274486400
+    assert y != x
+
+    # All fields are copied independently
+    x = TimeRange(None, "date", 0, 1438214400)
+    y = x.copy()
+    assert y.starttype is None
+    assert y.stoptype == "date"
+    assert y.startts == 0
+    assert y.stopts == 1438214400
+
+
+def test_adjust_start_if_necessary():
+    min_date = datetime(2017, 11, 14, 21, 15, 00, tzinfo=UTC)
+
+    x = TimeRange("date", "date", 1510694100, 1510780500)
+    # Adjust by 20 candles - min_date == startts
+    x.adjust_start_if_necessary(300, 20, min_date)
+    assert x.startts == 1510694100 + (20 * 300)
+
+    x = TimeRange("date", "date", 1510700100, 1510780500)
+    # Do nothing, startup is set and different min_date
+    x.adjust_start_if_necessary(300, 20, min_date)
+    assert x.startts == 1510694100 + (20 * 300)
+
+    x = TimeRange(None, "date", 0, 1510780500)
+    # Adjust by 20 candles = 20 * 5m
+    x.adjust_start_if_necessary(300, 20, min_date)
+    assert x.startts == 1510694100 + (20 * 300)
