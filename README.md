@@ -739,7 +739,8 @@ For questions, development discussions, custom trading-bot work, or integrations
 ### Telegram
 
 **[@nexastruct](https://t.me/nexastruct)**
-### Telegram
+
+### Whatsapp
 
 **+1 858 413 7275**
 
